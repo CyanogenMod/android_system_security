@@ -27,13 +27,16 @@ LOCAL_SRC_FILES := eng_keystore.cpp
 LOCAL_CFLAGS := -fvisibility=hidden -Wall -Werror
 
 LOCAL_C_INCLUDES += \
-	system/security/keystore \
 	external/openssl/include
 
 LOCAL_SHARED_LIBRARIES += \
 	libcrypto \
 	liblog \
 	libcutils \
-	libkeystore_client
+	libutils \
+	libbinder \
+	libkeystore_binder
+
+LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
 include $(BUILD_SHARED_LIBRARY)
