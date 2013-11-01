@@ -42,6 +42,8 @@
 
 #include <hardware/keymaster.h>
 
+#include <keymaster/softkeymaster.h>
+
 #include <utils/String8.h>
 #include <utils/UniquePtr.h>
 #include <utils/Vector.h>
@@ -56,6 +58,8 @@
 
 #include <keystore/keystore.h>
 
+#include "defaults.h"
+
 /* KeyStore is a secured storage for key-value pairs. In this implementation,
  * each file stores one key-value pair. Keys are encoded in file names, and
  * values are encrypted with checksums. The encryption key is protected by a
@@ -66,6 +70,13 @@
 #define VALUE_SIZE      32768
 #define PASSWORD_SIZE   VALUE_SIZE
 
+
+struct BIGNUM_Delete {
+    void operator()(BIGNUM* p) const {
+        BN_free(p);
+    }
+};
+typedef UniquePtr<BIGNUM, BIGNUM_Delete> Unique_BIGNUM;
 
 struct BIO_Delete {
     void operator()(BIO* p) const {
@@ -261,13 +272,6 @@ static int encode_key(char* out, const android::String8& keyName) {
     return length;
 }
 
-static int encode_key_for_uid(char* out, uid_t uid, const android::String8& keyName) {
-    int n = snprintf(out, NAME_MAX, "%u_", uid);
-    out += n;
-
-    return n + encode_key(out, keyName);
-}
-
 /*
  * Converts from the "escaped" format on disk to actual name.
  * This will be smaller than the input string.
@@ -417,7 +421,11 @@ public:
         mBlob.version = CURRENT_BLOB_VERSION;
         mBlob.type = uint8_t(type);
 
-        mBlob.flags = KEYSTORE_FLAG_NONE;
+        if (type == TYPE_MASTER_KEY) {
+            mBlob.flags = KEYSTORE_FLAG_ENCRYPTED;
+        } else {
+            mBlob.flags = KEYSTORE_FLAG_NONE;
+        }
     }
 
     Blob(blob b) {
@@ -459,6 +467,18 @@ public:
             mBlob.flags |= KEYSTORE_FLAG_ENCRYPTED;
         } else {
             mBlob.flags &= ~KEYSTORE_FLAG_ENCRYPTED;
+        }
+    }
+
+    bool isFallback() const {
+        return mBlob.flags & KEYSTORE_FLAG_FALLBACK;
+    }
+
+    void setFallback(bool fallback) {
+        if (fallback) {
+            mBlob.flags |= KEYSTORE_FLAG_FALLBACK;
+        } else {
+            mBlob.flags &= ~KEYSTORE_FLAG_FALLBACK;
         }
     }
 
@@ -905,19 +925,19 @@ public:
     }
 
     android::String8 getKeyName(const android::String8& keyName) {
-        char encoded[encode_key_length(keyName)];
+        char encoded[encode_key_length(keyName) + 1];	// add 1 for null char
         encode_key(encoded, keyName);
         return android::String8(encoded);
     }
 
     android::String8 getKeyNameForUid(const android::String8& keyName, uid_t uid) {
-        char encoded[encode_key_length(keyName)];
+        char encoded[encode_key_length(keyName) + 1];	// add 1 for null char
         encode_key(encoded, keyName);
         return android::String8::format("%u_%s", uid, encoded);
     }
 
     android::String8 getKeyNameForUidWithDir(const android::String8& keyName, uid_t uid) {
-        char encoded[encode_key_length(keyName)];
+        char encoded[encode_key_length(keyName) + 1];	// add 1 for null char
         encode_key(encoded, keyName);
         return android::String8::format("%s/%u_%s", getUserState(uid)->getUserDirName(), uid,
                 encoded);
@@ -995,6 +1015,23 @@ public:
             }
         }
 
+        /*
+         * This will upgrade software-backed keys to hardware-backed keys when
+         * the HAL for the device supports the newer key types.
+         */
+        if (rc == NO_ERROR && type == TYPE_KEY_PAIR
+                && mDevice->common.module->module_api_version >= KEYMASTER_MODULE_API_VERSION_0_2
+                && keyBlob->isFallback()) {
+            ResponseCode imported = importKey(keyBlob->getValue(), keyBlob->getLength(), filename,
+                    uid, keyBlob->isEncrypted() ? KEYSTORE_FLAG_ENCRYPTED : KEYSTORE_FLAG_NONE);
+
+            // The HAL allowed the import, reget the key to have the "fresh"
+            // version.
+            if (imported == NO_ERROR) {
+                rc = get(filename, keyBlob, TYPE_KEY_PAIR, uid);
+            }
+        }
+
         if (type != TYPE_ANY && keyBlob->getType() != type) {
             ALOGW("key found but type doesn't match: %d vs %d", keyBlob->getType(), type);
             return KEY_NOT_FOUND;
@@ -1047,37 +1084,48 @@ public:
             return SYSTEM_ERROR;
         }
 
+        bool isFallback = false;
         rc = mDevice->import_keypair(mDevice, key, keyLen, &data, &dataLength);
         if (rc) {
-            ALOGE("Error while importing keypair: %d", rc);
-            return SYSTEM_ERROR;
+            // If this is an old device HAL, try to fall back to an old version
+            if (mDevice->common.module->module_api_version < KEYMASTER_MODULE_API_VERSION_0_2) {
+                rc = openssl_import_keypair(mDevice, key, keyLen, &data, &dataLength);
+                isFallback = true;
+            }
+
+            if (rc) {
+                ALOGE("Error while importing keypair: %d", rc);
+                return SYSTEM_ERROR;
+            }
         }
 
         Blob keyBlob(data, dataLength, NULL, 0, TYPE_KEY_PAIR);
         free(data);
 
         keyBlob.setEncrypted(flags & KEYSTORE_FLAG_ENCRYPTED);
+        keyBlob.setFallback(isFallback);
 
         return put(filename, &keyBlob, uid);
     }
 
-    bool isHardwareBacked() const {
-        return (mDevice->flags & KEYMASTER_SOFTWARE_ONLY) == 0;
+    bool isHardwareBacked(const android::String16& keyType) const {
+        if (mDevice == NULL) {
+            ALOGW("can't get keymaster device");
+            return false;
+        }
+
+        if (sRSAKeyType == keyType) {
+            return (mDevice->flags & KEYMASTER_SOFTWARE_ONLY) == 0;
+        } else {
+            return (mDevice->flags & KEYMASTER_SOFTWARE_ONLY) == 0
+                    && (mDevice->common.module->module_api_version
+                            >= KEYMASTER_MODULE_API_VERSION_0_2);
+        }
     }
 
     ResponseCode getKeyForName(Blob* keyBlob, const android::String8& keyName, const uid_t uid,
             const BlobType type) {
-        char filename[NAME_MAX];
-        encode_key_for_uid(filename, uid, keyName);
-
-        UserState* userState = getUserState(uid);
-        android::String8 filepath8;
-
-        filepath8 = android::String8::format("%s/%s", userState->getUserDirName(), filename);
-        if (filepath8.string() == NULL) {
-            ALOGW("can't create filepath for key %s", filename);
-            return SYSTEM_ERROR;
-        }
+        android::String8 filepath8(getKeyNameForUidWithDir(keyName, uid));
 
         ResponseCode responseCode = get(filepath8.string(), keyBlob, type, uid);
         if (responseCode == NO_ERROR) {
@@ -1087,8 +1135,7 @@ public:
         // If this is one of the legacy UID->UID mappings, use it.
         uid_t euid = get_keystore_euid(uid);
         if (euid != uid) {
-            encode_key_for_uid(filename, euid, keyName);
-            filepath8 = android::String8::format("%s/%s", userState->getUserDirName(), filename);
+            filepath8 = getKeyNameForUidWithDir(keyName, euid);
             responseCode = get(filepath8.string(), keyBlob, type, uid);
             if (responseCode == NO_ERROR) {
                 return responseCode;
@@ -1096,13 +1143,14 @@ public:
         }
 
         // They might be using a granted key.
-        encode_key(filename, keyName);
+        android::String8 filename8 = getKeyName(keyName);
         char* end;
-        strtoul(filename, &end, 10);
+        strtoul(filename8.string(), &end, 10);
         if (end[0] != '_' || end[1] == 0) {
             return KEY_NOT_FOUND;
         }
-        filepath8 = android::String8::format("%s/%s", userState->getUserDirName(), filename);
+        filepath8 = android::String8::format("%s/%s", getUserState(uid)->getUserDirName(),
+                filename8.string());
         if (!hasGrant(filepath8.string(), uid)) {
             return responseCode;
         }
@@ -1157,6 +1205,7 @@ public:
 private:
     static const char* sOldMasterKey;
     static const char* sMetaDataFile;
+    static const android::String16 sRSAKeyType;
     Entropy* mEntropy;
 
     keymaster_device_t* mDevice;
@@ -1373,6 +1422,8 @@ private:
 const char* KeyStore::sOldMasterKey = ".masterkey";
 const char* KeyStore::sMetaDataFile = ".metadata";
 
+const android::String16 KeyStore::sRSAKeyType("RSA");
+
 namespace android {
 class KeyStoreProxy : public BnKeystoreService, public IBinder::DeathRecipient {
 public:
@@ -1445,6 +1496,8 @@ public:
         String8 filename(mKeyStore->getKeyNameForUidWithDir(name8, targetUid));
 
         Blob keyBlob(item, itemLength, NULL, 0, ::TYPE_GENERIC);
+        keyBlob.setEncrypted(flags & KEYSTORE_FLAG_ENCRYPTED);
+
         return mKeyStore->put(filename.string(), &keyBlob, callingUid);
     }
 
@@ -1656,7 +1709,8 @@ public:
         return mKeyStore->isEmpty(callingUid) ? ::KEY_NOT_FOUND : ::NO_ERROR;
     }
 
-    int32_t generate(const String16& name, int targetUid, int32_t flags) {
+    int32_t generate(const String16& name, int32_t targetUid, int32_t keyType, int32_t keySize,
+            int32_t flags, Vector<sp<KeystoreArg> >* args) {
         uid_t callingUid = IPCThreadState::self()->getCallingUid();
         if (!has_permission(callingUid, P_INSERT)) {
             ALOGW("permission denied for %d: generate", callingUid);
@@ -1678,6 +1732,7 @@ public:
         uint8_t* data;
         size_t dataLength;
         int rc;
+        bool isFallback = false;
 
         const keymaster_device_t* device = mKeyStore->getDevice();
         if (device == NULL) {
@@ -1688,11 +1743,107 @@ public:
             return ::SYSTEM_ERROR;
         }
 
-        keymaster_rsa_keygen_params_t rsa_params;
-        rsa_params.modulus_size = 2048;
-        rsa_params.public_exponent = 0x10001;
+        if (keyType == EVP_PKEY_DSA) {
+            keymaster_dsa_keygen_params_t dsa_params;
+            memset(&dsa_params, '\0', sizeof(dsa_params));
 
-        rc = device->generate_keypair(device, TYPE_RSA, &rsa_params, &data, &dataLength);
+            if (keySize == -1) {
+                keySize = DSA_DEFAULT_KEY_SIZE;
+            } else if ((keySize % 64) != 0 || keySize < DSA_MIN_KEY_SIZE
+                    || keySize > DSA_MAX_KEY_SIZE) {
+                ALOGI("invalid key size %d", keySize);
+                return ::SYSTEM_ERROR;
+            }
+            dsa_params.key_size = keySize;
+
+            if (args->size() == 3) {
+                sp<KeystoreArg> gArg = args->itemAt(0);
+                sp<KeystoreArg> pArg = args->itemAt(1);
+                sp<KeystoreArg> qArg = args->itemAt(2);
+
+                if (gArg != NULL && pArg != NULL && qArg != NULL) {
+                    dsa_params.generator = reinterpret_cast<const uint8_t*>(gArg->data());
+                    dsa_params.generator_len = gArg->size();
+
+                    dsa_params.prime_p = reinterpret_cast<const uint8_t*>(pArg->data());
+                    dsa_params.prime_p_len = pArg->size();
+
+                    dsa_params.prime_q = reinterpret_cast<const uint8_t*>(qArg->data());
+                    dsa_params.prime_q_len = qArg->size();
+                } else {
+                    ALOGI("not all DSA parameters were read");
+                    return ::SYSTEM_ERROR;
+                }
+            } else if (args->size() != 0) {
+                ALOGI("DSA args must be 3");
+                return ::SYSTEM_ERROR;
+            }
+
+            if (device->common.module->module_api_version >= KEYMASTER_MODULE_API_VERSION_0_2) {
+                rc = device->generate_keypair(device, TYPE_DSA, &dsa_params, &data, &dataLength);
+            } else {
+                isFallback = true;
+                rc = openssl_generate_keypair(device, TYPE_DSA, &dsa_params, &data, &dataLength);
+            }
+        } else if (keyType == EVP_PKEY_EC) {
+            keymaster_ec_keygen_params_t ec_params;
+            memset(&ec_params, '\0', sizeof(ec_params));
+
+            if (keySize == -1) {
+                keySize = EC_DEFAULT_KEY_SIZE;
+            } else if (keySize < EC_MIN_KEY_SIZE || keySize > EC_MAX_KEY_SIZE) {
+                ALOGI("invalid key size %d", keySize);
+                return ::SYSTEM_ERROR;
+            }
+            ec_params.field_size = keySize;
+
+            if (device->common.module->module_api_version >= KEYMASTER_MODULE_API_VERSION_0_2) {
+                rc = device->generate_keypair(device, TYPE_EC, &ec_params, &data, &dataLength);
+            } else {
+                isFallback = true;
+                rc = openssl_generate_keypair(device, TYPE_EC, &ec_params, &data, &dataLength);
+            }
+        } else if (keyType == EVP_PKEY_RSA) {
+            keymaster_rsa_keygen_params_t rsa_params;
+            memset(&rsa_params, '\0', sizeof(rsa_params));
+            rsa_params.public_exponent = RSA_DEFAULT_EXPONENT;
+
+            if (keySize == -1) {
+                keySize = RSA_DEFAULT_KEY_SIZE;
+            } else if (keySize < RSA_MIN_KEY_SIZE || keySize > RSA_MAX_KEY_SIZE) {
+                ALOGI("invalid key size %d", keySize);
+                return ::SYSTEM_ERROR;
+            }
+            rsa_params.modulus_size = keySize;
+
+            if (args->size() > 1) {
+                ALOGI("invalid number of arguments: %d", args->size());
+                return ::SYSTEM_ERROR;
+            } else if (args->size() == 1) {
+                sp<KeystoreArg> pubExpBlob = args->itemAt(0);
+                if (pubExpBlob != NULL) {
+                    Unique_BIGNUM pubExpBn(
+                            BN_bin2bn(reinterpret_cast<const unsigned char*>(pubExpBlob->data()),
+                                    pubExpBlob->size(), NULL));
+                    if (pubExpBn.get() == NULL) {
+                        ALOGI("Could not convert public exponent to BN");
+                        return ::SYSTEM_ERROR;
+                    }
+                    unsigned long pubExp = BN_get_word(pubExpBn.get());
+                    if (pubExp == 0xFFFFFFFFL) {
+                        ALOGI("cannot represent public exponent as a long value");
+                        return ::SYSTEM_ERROR;
+                    }
+                    rsa_params.public_exponent = pubExp;
+                }
+            }
+
+            rc = device->generate_keypair(device, TYPE_RSA, &rsa_params, &data, &dataLength);
+        } else {
+            ALOGW("Unsupported key type %d", keyType);
+            rc = -1;
+        }
+
         if (rc) {
             return ::SYSTEM_ERROR;
         }
@@ -1702,6 +1853,9 @@ public:
 
         Blob keyBlob(data, dataLength, NULL, 0, TYPE_KEY_PAIR);
         free(data);
+
+        keyBlob.setEncrypted(flags & KEYSTORE_FLAG_ENCRYPTED);
+        keyBlob.setFallback(isFallback);
 
         return mKeyStore->put(filename.string(), &keyBlob, callingUid);
     }
@@ -1767,8 +1921,13 @@ public:
         params.digest_type = DIGEST_NONE;
         params.padding_type = PADDING_NONE;
 
-        rc = device->sign_data(device, &params, keyBlob.getValue(), keyBlob.getLength(),
-                data, length, out, outLength);
+        if (keyBlob.isFallback()) {
+            rc = openssl_sign_data(device, &params, keyBlob.getValue(), keyBlob.getLength(), data,
+                    length, out, outLength);
+        } else {
+            rc = device->sign_data(device, &params, keyBlob.getValue(), keyBlob.getLength(), data,
+                    length, out, outLength);
+        }
         if (rc) {
             ALOGW("device couldn't sign data");
             return ::SYSTEM_ERROR;
@@ -1814,8 +1973,13 @@ public:
         params.digest_type = DIGEST_NONE;
         params.padding_type = PADDING_NONE;
 
-        rc = device->verify_data(device, &params, keyBlob.getValue(), keyBlob.getLength(),
-                data, dataLength, signature, signatureLength);
+        if (keyBlob.isFallback()) {
+            rc = openssl_verify_data(device, &params, keyBlob.getValue(), keyBlob.getLength(), data,
+                    dataLength, signature, signatureLength);
+        } else {
+            rc = device->verify_data(device, &params, keyBlob.getValue(), keyBlob.getLength(), data,
+                    dataLength, signature, signatureLength);
+        }
         if (rc) {
             return ::SYSTEM_ERROR;
         } else {
@@ -1862,8 +2026,14 @@ public:
             return ::SYSTEM_ERROR;
         }
 
-        int rc = device->get_keypair_public(device, keyBlob.getValue(), keyBlob.getLength(), pubkey,
-                pubkeyLength);
+        int rc;
+        if (keyBlob.isFallback()) {
+            rc = openssl_get_keypair_public(device, keyBlob.getValue(), keyBlob.getLength(), pubkey,
+                    pubkeyLength);
+        } else {
+            rc = device->get_keypair_public(device, keyBlob.getValue(), keyBlob.getLength(), pubkey,
+                    pubkeyLength);
+        }
         if (rc) {
             return ::SYSTEM_ERROR;
         }
@@ -1901,7 +2071,7 @@ public:
             rc = ::SYSTEM_ERROR;
         } else {
             // A device doesn't have to implement delete_keypair.
-            if (device->delete_keypair != NULL) {
+            if (device->delete_keypair != NULL && !keyBlob.isFallback()) {
                 if (device->delete_keypair(device, keyBlob.getValue(), keyBlob.getLength())) {
                     rc = ::SYSTEM_ERROR;
                 }
@@ -2053,8 +2223,8 @@ public:
         return mKeyStore->put(targetFile.string(), &keyBlob, callingUid);
     }
 
-    int32_t is_hardware_backed() {
-        return mKeyStore->isHardwareBacked() ? 1 : 0;
+    int32_t is_hardware_backed(const String16& keyType) {
+        return mKeyStore->isHardwareBacked(keyType) ? 1 : 0;
     }
 
     int32_t clear_uid(int64_t targetUid) {
@@ -2114,7 +2284,7 @@ public:
 
             if (keyBlob.getType() == ::TYPE_KEY_PAIR) {
                 // A device doesn't have to implement delete_keypair.
-                if (device->delete_keypair != NULL) {
+                if (device->delete_keypair != NULL && !keyBlob.isFallback()) {
                     if (device->delete_keypair(device, keyBlob.getValue(), keyBlob.getLength())) {
                         rc = ::SYSTEM_ERROR;
                         ALOGW("device couldn't remove %s", filename.string());
