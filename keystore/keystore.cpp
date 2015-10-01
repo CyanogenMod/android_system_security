@@ -1201,6 +1201,15 @@ public:
         if (keyBlob->getType() == TYPE_KEY_PAIR) {
             keyBlob->setType(TYPE_KEYMASTER_10);
             rc = this->put(filename, keyBlob, userId);
+            if (rc != NO_ERROR) {
+                return rc;
+            }
+
+            rc = keyBlob->readBlob(filename, userState->getDecryptionKey(),
+                userState->getState());
+            if (rc != NO_ERROR) {
+                return rc;
+            }
         }
 
         if (type != TYPE_ANY && keyBlob->getType() != type) {
