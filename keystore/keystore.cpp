@@ -2441,7 +2441,8 @@ public:
                 {
                     uid_t callingUid = IPCThreadState::self()->getCallingUid();
                     Blob keyBlob;
-                    String8 name8(reinterpret_cast<const char*>(param.blob.data));
+                    String8 name8(reinterpret_cast<const char*>(param.blob.data),
+                                                        param.blob.data_length);
                     ResponseCode responseCode = mKeyStore->getKeyForName(&keyBlob,
                             name8, callingUid, TYPE_KEYMASTER_10);
                     if (responseCode != ::NO_ERROR) {
